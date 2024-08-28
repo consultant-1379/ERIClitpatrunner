@@ -1,0 +1,12 @@
+*.pyc
+*.swp
+target
+nosetests.xml
+coverage.xml
+.coverage
+.project
+.pydevproject
+LITP_ATs.egg-info
+bin/runatsc
+doc/sphinx/source/fw_docs/commands/commands.rst
+doc/sphinx/source/fw_docs/mocks/core_mocking.rst

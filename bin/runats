@@ -1,0 +1,504 @@
+#!/usr/bin/env python
+
+# vim: filetype=python
+
+import shlex
+import time
+import sys
+import os
+import traceback
+import argparse
+import logging
+import inspect
+import shutil
+import StringIO
+import re
+import cProfile
+import pstats
+
+def _setup_sys_path():
+    runats_dir = os.path.dirname(__file__)
+    # Runats is installed into usr/bin, therefore the root used to install
+    # dependency packages is
+    dep_root_dir = os.path.realpath(os.path.join(runats_dir, os.pardir, os.pardir))
+    sys.path.append(os.path.realpath(
+        os.path.join(dep_root_dir, 'opt', 'ericsson', 'nms', 'litp', 'lib')
+    ))
+
+_setup_sys_path()
+
+from litpats.atcli import ATCli
+from litpats.atcli import _green
+from litpats.atcli import _red
+from litpats.atcli import _print_verbose
+from litpats import mockfilesystem
+from litpats.runners.sequential_runner import SimpleRunner
+from litpats.runners.forking_runner import ForkingRunner
+
+# Importing these modules will cause Core mocks and patches to be registered
+import litpats.mocking.mocks
+import litpats.mocking.patches
+from litpats.mocking import enable_core_bypass
+import litp.metrics
+
+
+# Hash (#) indicates a comment unless it's escaped with a '\'.
+comment = re.compile(r'(?<!\\)#')
+
+
+def pretty_print_call(call_tuple):
+    if call_tuple[:2] == ('~', 0):
+        # special case for built-in functions
+        name = call_tuple[2]
+        if name.startswith('<') and name.endswith('>'):
+            return '{%s}' % name[1:-1]
+        else:
+            return name
+    else:
+        call_desc = "{module}::{call}()".format(
+            module=call_tuple[0],
+            call=call_tuple[2],
+        )
+        return "{call_desc} [{file}:{line}]".format(
+            call_desc=call_desc,
+            file=call_tuple[3],
+            line=call_tuple[1]
+        )
+
+pstats.func_std_string = pretty_print_call
+
+
+def build_call_tuple(code):
+    if isinstance(code, str):
+        return ('~', 0, code, '')
+    else:
+        code_module = inspect.getmodule(code)
+        if not code_module:
+            # This can happen for code objects that result from strings being
+            # exec'd, which the namedtuple implementation relies on.
+            return (
+                '~',
+                code.co_firstlineno,
+                code.co_name,
+                '<exec\'d string>'
+            )
+        return (
+            code_module.__name__,
+            code.co_firstlineno,
+            code.co_name,
+            code.co_filename
+        )
+
+cProfile.label = build_call_tuple
+
+
+def run_single_at(cli, filename, **options):
+
+    # The 'verbose_to_file' attribute is set in run_tests() before tests are
+    # added to the relevant runner's queue
+    if cli.verbose_to_file:
+        cli.verbose_log_file = open(os.path.splitext(filename)[0] +
+                ".txt", 'w')
+    _print_verbose(cli, "Running {0}".format(filename,), True)
+    start_time = time.time()
+
+    # The ATCli instance's attributes need to be reset. Or do they???
+    cli.debug_line = options['debug_line']
+    cli.verbose = options['verbose']
+    cli.update_expected = options['update_expected']
+    cli.root_path = options['root_path']
+    cli.show_errors = options['errors']
+    cli.performance = options['performance']
+    cli.line = 0
+
+    cli.filesystem = mockfilesystem.create(cli.root_path)
+    cli.run("clearLandscape", [])
+    cli.test_dir = os.path.abspath(os.path.dirname(filename))
+    cli.errors = []
+
+    profiler_line, profiler_sort, profiler_filter = options['profiler'] or \
+            (None, None, None)
+
+    pr = cProfile.Profile() if options['profiler'] else None
+
+    test_logging_stream = StringIO.StringIO()
+    test_log_formatter = logging.Formatter("%(levelname)s - %(message)s")
+    del logging.getLogger().handlers[0]
+    test_log_handler = logging.StreamHandler(test_logging_stream)
+    test_log_handler.setFormatter(test_log_formatter)
+    logging.getLogger().addHandler(test_log_handler)
+
+    # backup python path
+    sys_path = sys.path[:]
+    script = open(filename)
+    previous_line = ''
+    try:
+        max_time = (0, 0)
+        for line in script:
+            if line.endswith("\\\n"):
+                previous_line += line.split("\\\n")[0]
+                cli.line += 1
+                continue
+            if previous_line:
+                line = previous_line + line
+                previous_line = ''
+            cli.line += 1
+            line = comment.split(line)[0]
+            args = shlex.split(line)
+            if args:
+                command = args.pop(0)
+
+                run_profiler_for_current_line = (
+                    pr and (profiler_line is None or profiler_line == cli.line))
+
+                if run_profiler_for_current_line:
+                    pr.enable()
+
+                line_start_time = time.time()
+                ret = cli.run(command, args)
+                line_end_time = time.time()
+
+                if run_profiler_for_current_line:
+                    pr.disable()
+
+                dur = line_end_time - line_start_time
+                if ret == "Pass":
+                    _print_verbose(
+                        cli,
+                        "{0:4}: [{4:.3f}] {1} {2} {3}".format(
+                            cli.line, _green("Pass"),
+                            command, " ".join(args), dur
+                        ),
+                        False
+                    )
+                else:
+                    _print_verbose(cli, "{0:4}: [{3:.3f}] {1} {2}".format(cli.
+                        line, command, " ".join(args), dur), False)
+                if line_end_time - line_start_time > max_time[1]:
+                    max_time = (cli.line, line_end_time - line_start_time)
+        if cli.performance:
+            _print_verbose(cli, "%s %s (%.2f secs, line %s took the longest "
+            "time: %.2f secs)" % (filename, _green("Passed"), time.time() -
+                start_time, max_time[0], max_time[1]), True)
+        else:
+            _print_verbose(cli, "%s %s (%.2f secs)" % (filename, _green(
+                "Passed"), time.time() - start_time), True)
+        return True
+    except Exception, e:
+        _print_verbose(cli, "%s %s %s (%.2f secs)" % (_red("Error on line %s:"
+            % cli.line), e.__class__.__name__, e, time.time() - start_time),
+            True)
+        _print_verbose(cli, traceback.format_exc(), False)
+        return False
+    finally:
+        script.close()
+        if cli.verbose_to_file:
+            cli.verbose_log_file.close()
+        cli._remove_old_xsds()
+        sys.path[:] = sys_path
+        mockfilesystem.destroy()
+
+        if pr:
+            print "\nProfiler stats for line(s): %s" % profiler_line
+            s = StringIO.StringIO()
+            ps = pstats.Stats(pr, stream=s).sort_stats(profiler_sort)
+            if profiler_filter:
+                ps.print_stats(profiler_filter)
+            else:
+                ps.print_stats()
+            print s.getvalue()
+
+_runner = None
+
+
+def prepare_runner(concurrency):
+    global _runner
+    if concurrency == 0:
+        _runner = SimpleRunner()
+    else:
+        _runner = ForkingRunner(concurrency)
+
+
+def wait_for_runner():
+    global _runner
+    results = _runner.run_tasks()
+    num_failed = len([x for x in results if not x])
+    return num_failed
+
+
+def run_test(*args, **kwargs):
+    global _runner
+    _runner.add_task(run_single_at, *args, **kwargs)
+
+
+def run_tests(filepath, concurrency, **options):
+    failures_found = 0
+    tests_run = 0
+    start_time = time.time()
+
+    cover_packages = []
+    if options['cover_packages']:
+        cover_packages = options['cover_packages'].split(",")
+
+    if cover_packages:
+        import coverage
+        coverage_stats_collector = coverage.coverage(source=cover_packages)
+        coverage_stats_collector.start()
+
+    if options['metrics']:
+        metrics_handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter(
+            "%(asctime)s.%(msecs)d,%(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S")
+        metrics_handler.setFormatter(formatter)
+        litp.metrics.logger.addHandler(metrics_handler)
+
+    cli = ATCli()
+    cli.verbose_to_file = options['verbose_to_file']
+
+    prepare_runner(concurrency)
+
+    if os.path.isfile(filepath):
+        if filepath.endswith(".at"):
+            run_test(cli, filepath, **options)
+            tests_run = 1
+
+    elif os.path.isdir(filepath):
+        all_files = [(dirpath, filenames) for
+                dirpath, _, filenames in os.walk(filepath)]
+        all_files.sort(key=lambda t: t[0])
+        for dir_entry in all_files:
+            dir_entry[1].sort()
+
+        for (dirpath, filenames) in all_files:
+            for filename in filenames:
+                if filename.endswith(".at"):
+                    run_test(cli, os.path.join(dirpath, filename), **options)
+                    tests_run += 1
+
+    failures_found = wait_for_runner()
+
+    print "Ran %s tests (%s failures) in %.2f seconds" % (tests_run,
+        failures_found, time.time() - start_time)
+
+    if cover_packages:
+        coverage_stats_collector.stop()
+        coverage_stats_collector.report()
+
+    return failures_found
+
+
+def show_commands():
+    cli = ATCli()
+    helpstr = "AT Runner available commands:\n"
+    for command in cli.commands:
+        method = cli.commands[command]
+        args = inspect.getargspec(method).args
+        helpstr += "%s:\n    Usage: %s %s\n" % (command, command,
+            " ".join([arg for arg in args[1:]]))
+        helpstr += "    %s\n\n" % (method.__doc__ or "",)
+    print helpstr
+
+
+class ProfilerAction(argparse.Action):
+    SORTBY_DEFAULT = "time"
+    SORTBY_VALUES = set(["time", "cumulative"])
+    FILTER_DEFAULT = "all"
+    FILTER_REGEXES = {
+        "litp": r'^(^(litp|litpcli|serializer))\.',
+        "atrunner": r'^litpats\.',
+        "libs": r'^(?!(litp|litpats|litpcli|serializer))',
+        "all": None
+    }
+
+    def __init__(self, *args, **kwargs):
+        super(ProfilerAction, self).__init__(*args, **kwargs)
+        self.metavar = 'LINE,SORTBY,FILTER'
+        self.help = '''
+        Enables the collection of cProfile stats during AT execution.
+        This option expects a comma-separated list of up to three elements:
+        LINE can be a line number or 'all',
+        SORTBY can be 'time' or 'cumulative',
+        FILTER can be 'litp', 'atrunner', 'libs' or 'all'
+        '''
+
+    def parse(self, value):
+        value = value.strip()
+        if value == "":
+            raise ValueError("No argument given")
+
+        args = value.split(",", 3)
+        if len(args) == 3:
+            line, sortby, filterby = args
+            if sortby not in self.SORTBY_VALUES:
+                raise ValueError(
+                    "invalid sort value: %s (valid values are: %s)" % (
+                        sortby, ",".join(self.SORTBY_VALUES)))
+            if filterby not in self.FILTER_REGEXES:
+                raise ValueError(
+                    "invalid filter value: %s (valid values are: %s)" % (
+                        filterby, ",".join(self.FILTER_REGEXES)))
+        elif len(args) == 2:
+            line = args[0]
+            if sortby not in self.SORTBY_VALUES:
+                raise ValueError(
+                    "invalid sort value: %s (valid values are: %s)" % (
+                        sortby, ",".join(self.SORTBY_VALUES)))
+            filterby = self.FILTER_DEFAULT
+        elif len(args) == 1:
+            line = args[0]
+            sortby = self.SORTBY_DEFAULT
+            filterby = self.FILTER_DEFAULT
+        else:
+            raise ValueError(
+                "invalid value: %s, valid format is: "
+                "(LINE_NUMBER|all)[,sort]" % (value,))
+        if line.lower() == "all":
+            line = None
+        else:
+            try:
+                line = int(line)
+            except ValueError:
+                raise ValueError("invalid line number: %s" % line)
+        return line, sortby, self.FILTER_REGEXES[filterby]
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        try:
+            parsed = self.parse(value)
+        except ValueError, e:
+            raise argparse.ArgumentError(self, str(e))
+        setattr(namespace, self.dest, parsed)
+
+
+def setup_arg_parser():
+    parser = argparse.ArgumentParser()
+
+    output_options_group = parser.add_argument_group(
+        "Output options",
+        description="These options modify the output produced by the AT runner"
+    )
+    output_options_group.add_argument("-l", "--log", dest="log",
+        action="store_true", help="Print logs to console")
+    # Does this only makes sense when -l is given?
+    output_options_group.add_argument("-i", "--log-level", dest="log_level",
+        choices=["debug", "error"], help="Set the log level")
+
+    output_options_group.add_argument("-e", "--errors", dest="errors",
+        action="store_true", help="Show all LITP errors returned during "\
+                "the execution of a LITP CLI command")
+    output_options_group.add_argument("-v", "--verbose", dest="verbose",
+        action="store_true", help="Print AT lines to console")
+    output_options_group.add_argument("-f", "--verbose-to-file",
+        dest="verbose_to_file", action="store_true",
+        help="Print AT lines to a log file processed by Jenkins")
+
+    instrumentation_options_group = parser.add_argument_group(
+        "Instrumentation options",
+        description="These options enable instrumentation to be added to ATs"
+    )
+    instrumentation_options_group.add_argument("-c", "--cover-packages",
+        dest="cover_packages", metavar="packages",
+        help="Add statement coverage report for a comma-separated list "\
+            "of Python packages")
+    instrumentation_options_group.add_argument("-p", "--performance",
+        dest="performance", action="store_true",
+        help="Show the line that took the longest for each AT")
+    instrumentation_options_group.add_argument("-m", "--metrics",
+        dest="metrics", action="store_true",
+        help="Show LITP metrics for every AT")
+
+    instrumentation_options_group.add_argument("--profiler", dest="profiler",
+        action=ProfilerAction)
+
+    # Execution mode
+    execution_options_group = parser.add_argument_group(
+        "Execution options",
+        description="These options modify the behaviour of the AT runner"
+    )
+    execution_options_group.add_argument("-s", "--show-commands",
+        dest="showcommands", action="store_true",
+        help="Show all available commands and exits")
+    execution_options_group.add_argument("--update-expected",
+        dest="update_expected", action="store_true",
+        help="Update the files used in assertions so that their contents "\
+            "match what they're compared against in ATs. Use with caution!")
+
+    ## This only makes sense if we"re running a *single* AT
+    execution_options_group.add_argument("-d", "--debug", dest="debug_line",
+        type=int, metavar="LINE", help="Enter interactive debugger at line")
+
+    execution_options_group.add_argument("-j", "--jobs", dest="jobs", type=int,
+            metavar="CONCURRENCY", help="Number of tests to run at once")
+
+    parser.add_argument("-r", "--root", dest="root_path",
+        default="target/deps/opt/ericsson/nms/litp",
+        help="LITP root install dir")
+    return parser
+
+
+def options_require_sequential_execution(options):
+    # These options, if specified, mean that we cannot run multiple tests
+    # in parallel.
+    _options_requiring_sequential_execution = (
+        'cover_packages',
+        'debug_line',
+        'profiler',
+        'verbose_to_file',
+    )
+
+    call_options = set([opt for opt in vars(options) if vars(options)[opt]])
+    return set(_options_requiring_sequential_execution) & call_options
+
+
+if __name__ == "__main__":
+    cli_arg_parser = setup_arg_parser()
+    options, non_option_args = cli_arg_parser.parse_known_args()
+
+    concurrency = 0
+    num_cpu = os.sysconf('SC_NPROCESSORS_ONLN')
+    max_jobs = 2 * num_cpu
+    if options.jobs is None:
+        if not options_require_sequential_execution(options):
+            concurrency = num_cpu + 1
+    else:
+        concurrency = options.jobs
+        if concurrency > max_jobs:
+            raise SystemError("You can use at most %d concurrent AT "
+                "execution processes" % max_jobs)
+        if concurrency > 0:
+            # User has specified multiple parallel jobs. Is that okay?
+            clashing_options = options_require_sequential_execution(options)
+            if clashing_options:
+                raise SystemError("Use of non-zero value for --jobs is "
+                    "incompatible with these options: %s" % clashing_options)
+
+    enable_core_bypass()
+
+    test_log_stream = StringIO.StringIO()
+    test_log_handler = logging.StreamHandler(test_log_stream)
+    logging.getLogger().addHandler(test_log_handler)
+
+    if options.log or options.log_level is not None:
+        stdout1 = logging.StreamHandler(sys.stdout)
+        stdout1.setFormatter(logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        logging.getLogger().addHandler(stdout1)
+
+        log_level = logging.DEBUG
+        if options.log_level is not None:
+            log_level = getattr(logging, options.log_level.upper())
+        stdout1.setLevel(log_level)
+
+    logging.getLogger().setLevel(logging.DEBUG)
+
+    if len(non_option_args):
+        filepath = non_option_args[0].strip()
+    else:
+        filepath = os.curdir
+
+    if options.showcommands:
+        show_commands()
+    else:
+        errors = run_tests(filepath, concurrency, **vars(options))
+        if errors:
+            sys.exit(1)

@@ -1,0 +1,213 @@
+<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.ericsson.nms.litp</groupId>
+  <artifactId>ERIClitpatrunner_CXP9030558</artifactId>
+  <version>2.2.2-SNAPSHOT</version>
+  <packaging>rpm</packaging>
+  <name>ERIClitpatrunner</name>
+  <description>LITP AT runner</description>
+  <parent>
+    <groupId>com.ericsson.nms.litp</groupId>
+    <artifactId>ERIClitpatrunner</artifactId>
+    <version>2.2.2-SNAPSHOT</version>
+  </parent>
+  <properties>
+    <!-- we do our own thing for ATs in this module... -->
+    <com.ericsson.nms.litp.runats.skip>true</com.ericsson.nms.litp.runats.skip>
+    <!-- publishes the rpm module to the ci portal -->
+    <publish_artifact>true</publish_artifact>
+    <bom_version>RELEASE</bom_version>
+    <minimum_core_version>2.2.0</minimum_core_version>
+  </properties>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.tomdz.maven</groupId>
+        <artifactId>sphinx-maven-plugin</artifactId>
+        <version>1.0.1</version>
+        <executions>
+          <execution>
+            <id>Initial download of Sphinx</id>
+            <phase>initialize</phase>
+            <goals>
+              <goal>generate</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>Build html files</id>
+            <phase>process-resources</phase>
+            <goals>
+              <goal>exec</goal>
+            </goals>
+            <configuration>
+              <executable>doc/build_html.py</executable>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!--
+        Download the core RPM without making it a dependency of the project.
+        This allows UTs and PyLint to import modules provided by the core
+        artifact without making the core artifact a dependency of ATrunner,
+        which would create a circular dependency.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>2.5</version>
+        <executions>
+          <execution>
+          <id>copy_core</id>
+          <phase>initialize</phase>
+          <goals>
+            <goal>copy</goal>
+          </goals>
+          <configuration>
+            <artifactItems>
+              <artifactItem>
+              <groupId>com.ericsson.nms.litp</groupId>
+              <artifactId>ERIClitpcore_CXP9030418</artifactId>
+              <!-- This will be unset for the latest-dep profile, causing Maven to use the version defined in the "parent BOM" -->
+              <version>${profile_core_version}</version>
+              <type>rpm</type>
+              <outputDirectory>${project.parent.build.directory}/deps</outputDirectory>
+              </artifactItem>
+            </artifactItems>
+          </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>rpm-maven-plugin</artifactId>
+        <version>2.1-alpha-1</version>
+        <extensions>true</extensions>
+        <configuration>
+          <requires>
+            <require>python &gt;= 2.7</require>
+            <require>python-crypto &gt;= 2.0.1-22</require>
+            <require>python-paramiko &gt;= 1.7.5-2.1.el6</require>
+            <require>python-setuptools &gt;= 0.6.10-3.el6</require>
+          </requires>
+          <mappings>
+            <mapping>
+              <directory>${app.home}/lib</directory>
+              <configuration>false</configuration>
+              <!-- We need this so that litp.py is executable -->
+              <filemode>775</filemode>
+              <sources>
+                <source>
+                  <location>../src</location>
+                  <includes>
+                    <include>**/*.py</include>
+                  </includes>
+                </source>
+              </sources>
+            </mapping>
+            <mapping>
+              <directory>/usr/bin</directory>
+              <filemode>755</filemode>
+              <sources>
+                <source>
+                  <location>../bin</location>
+                  <includes>
+                    <include>**/runats</include>
+                  </includes>
+                </source>
+              </sources>
+            </mapping>
+            <mapping>
+              <directory>/var</directory>
+              <configuration>false</configuration>
+              <sources>
+                <source>
+                  <location>../var</location>
+                  <includes>
+                    <include>**</include>
+                  </includes>
+                </source>
+              </sources>
+            </mapping>
+          </mappings>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+  <profiles>
+    <profile>
+      <id>current-dep</id>
+      <activation>
+        <property>
+          <name>!UsingLatest</name>
+        </property>
+      </activation>
+      <properties>
+        <profile_core_version>${minimum_core_version}</profile_core_version>
+        <!-- REST API changes that impact both ERIClitpcore and ERIClitpcli will require this version to be updated -->
+        <litpcli_version>2.2.0</litpcli_version>
+      </properties>
+      <dependencies>
+        <dependency>
+          <groupId>com.ericsson.nms.litp</groupId>
+          <artifactId>ERIClitpcli_CXP9030420</artifactId>
+          <version>${litpcli_version}</version>
+          <type>rpm</type>
+        </dependency>
+      </dependencies>
+    </profile>
+    <profile>
+      <id>latest-dep</id>
+      <properties>
+        <UsingLatest>true</UsingLatest>
+        <profile_core_version />
+      </properties>
+      <dependencyManagement>
+        <dependencies>
+          <dependency>
+            <groupId>com.ericsson.litp</groupId>
+            <artifactId>ci-bom</artifactId>
+            <version>${bom_version}</version>
+            <type>pom</type>
+            <scope>import</scope>
+          </dependency>
+        </dependencies>
+      </dependencyManagement>
+      <dependencies>
+        <dependency>
+          <groupId>com.ericsson.nms.litp</groupId>
+          <artifactId>ERIClitpcli_CXP9030420</artifactId>
+          <type>rpm</type>
+        </dependency>
+      </dependencies>
+    </profile>
+    <profile>
+      <id>site_versioned</id>
+      <distributionManagement>
+        <site>
+          <id>site</id>
+          <name>Site</name>
+          <url>${site.url}/ERIClitpatrunner/${project.version}</url>
+        </site>
+      </distributionManagement>
+    </profile>
+    <profile>
+      <id>site_latest</id>
+      <distributionManagement>
+        <site>
+          <id>site</id>
+          <name>Site</name>
+          <url>${site.url}/ERIClitpatrunner/latest</url>
+        </site>
+      </distributionManagement>
+    </profile>
+  </profiles>
+</project>

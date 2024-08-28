@@ -1,0 +1,2 @@
+This file is just here so that the "test" directory will exist.
+This seems to matter for some versions of nosetests.
